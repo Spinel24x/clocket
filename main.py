@@ -15,8 +15,14 @@ import uvicorn
 # ==================== Settings ====================
 CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = "/app/data/panel.db"
+CONFIG_PATH = "/app/configs/xray.json"
+XRAY_PORT = 10000
+
+print(f"CF_DOMAIN: {CF_DOMAIN}")
+print(f"Panel port: {PORT}")
+print(f"Xray port: {XRAY_PORT}")
 
 # ==================== Database ====================
 def get_db():
@@ -94,23 +100,27 @@ def generate_xray_config():
     xray_config = {
         "log": {"loglevel": "warning"},
         "inbounds": [{
-            "port": 10000,
+            "listen": "127.0.0.1",
+            "port": XRAY_PORT,
             "protocol": "vless",
             "settings": {"clients": clients, "decryption": "none"},
-            "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/ws"}}
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/ws"}
+            }
         }],
         "outbounds": [{"protocol": "freedom", "settings": {}}]
     }
 
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
-    with open("/app/configs/xray.json", "w") as f:
+    with open(CONFIG_PATH, "w") as f:
         json.dump(xray_config, f, indent=2)
-    
+
     return xray_config
 
-@app.on_event("startup")
-def startup():
-    generate_xray_config()
+# Generate config on startup
+generate_xray_config()
 
 # ==================== Session ====================
 sessions = {}
@@ -130,26 +140,27 @@ def require_admin(request: Request):
 # ==================== FastAPI App ====================
 app = FastAPI()
 
-# Static files
-@app.get("/style.css")
-async def style(): return FileResponse("style.css", media_type="text/css")
-
-@app.get("/script.js")
-async def script(): return FileResponse("script.js", media_type="application/javascript")
+@app.get("/")
+async def root():
+    return RedirectResponse("/login.html")
 
 @app.get("/login.html")
-async def login_html(): return FileResponse("login.html")
+async def login_page():
+    return FileResponse("login.html")
 
 @app.get("/dashboard.html")
-async def dashboard_html(): return FileResponse("dashboard.html")
+async def dashboard_page(request: Request):
+    try:
+        get_current_user(request)
+        return FileResponse("dashboard.html")
+    except HTTPException:
+        return RedirectResponse("/login.html")
 
-@app.get("/", response_class=RedirectResponse)
-async def root(): return RedirectResponse("/login.html")
+@app.get("/style.css")
+async def css(): return FileResponse("style.css", media_type="text/css")
 
-@app.get("/api/xray-config")
-async def api_xray_config(request: Request):
-    require_admin(request)
-    return JSONResponse(generate_xray_config())
+@app.get("/script.js")
+async def js(): return FileResponse("script.js", media_type="application/javascript")
 
 # ==================== Auth API ====================
 @app.post("/api/login")
@@ -164,8 +175,8 @@ async def api_login(response: Response, username: str = Form(...), password: str
         "id": user["id"], "username": user["username"],
         "is_admin": bool(user["is_admin"]), "config_id": user["config_id"]
     }
-    resp = JSONResponse({"success": True, "redirect": "/dashboard.html", "is_admin": bool(user["is_admin"])})
-    resp.set_cookie(key="session_id", value=session_id, httponly=True, samesite="lax", max_age=86400, path="/")
+    resp = JSONResponse({"success": True, "is_admin": bool(user["is_admin"])})
+    resp.set_cookie("session_id", session_id, httponly=True, samesite="lax", max_age=86400, path="/")
     return resp
 
 @app.post("/api/logout")
@@ -195,10 +206,8 @@ async def get_configs(request: Request):
     } for r in rows]
 
 @app.post("/api/configs")
-async def create_config(
-    request: Request, name: str = Form(""), remarks: str = Form(""),
-    traffic_limit_gb: float = Form(0), expire_days: int = Form(0)
-):
+async def create_config(request: Request, name: str = Form(""), remarks: str = Form(""),
+                        traffic_limit_gb: float = Form(0), expire_days: int = Form(0)):
     require_admin(request)
     new_uuid = str(uuid.uuid4())
     expire_at = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S") if expire_days > 0 else None
@@ -209,16 +218,16 @@ async def create_config(
     config_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.close()
     generate_xray_config()
-    return {"success": True, "id": config_id, "uuid": new_uuid, "link": generate_vless_link(new_uuid, remarks), "domain_set": bool(CF_DOMAIN)}
+    return {"success": True, "id": config_id, "uuid": new_uuid,
+            "link": generate_vless_link(new_uuid, remarks), "domain_set": bool(CF_DOMAIN)}
 
 @app.put("/api/configs/{config_id}")
 async def update_config(request: Request, config_id: int, name: str = Form(""), remarks: str = Form(""),
-                        traffic_limit_gb: float = Form(0), expire_days: int = Form(0)):
+                        traffic_limit_gb: float = Form(0)):
     require_admin(request)
-    expire_at = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S") if expire_days > 0 else None
     conn = get_db()
-    conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=?, expire_at=? WHERE id=?",
-                 (name, remarks, traffic_limit_gb, expire_at, config_id))
+    conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=? WHERE id=?",
+                 (name, remarks, traffic_limit_gb, config_id))
     conn.commit(); conn.close()
     generate_xray_config()
     return {"success": True}
@@ -265,11 +274,12 @@ async def create_user(request: Request, username: str = Form(...), password: str
     hashed = pwd_context.hash(password)
     conn = get_db()
     try:
-        conn.execute("INSERT INTO users (username, password, config_id) VALUES (?, ?, ?)", (username, hashed, config_id))
+        conn.execute("INSERT INTO users (username, password, config_id) VALUES (?, ?, ?)",
+                     (username, hashed, config_id))
         conn.commit()
         return {"success": True}
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Username already exists")
+        raise HTTPException(status_code=400, detail="Username exists")
     finally:
         conn.close()
 
