@@ -5,7 +5,6 @@ import sqlite3
 import subprocess
 import secrets
 import hashlib
-import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -16,7 +15,6 @@ USER_PASS = os.getenv("USER_PASS", "admin123")
 DB_PATH = "/app/data/panel.db"
 CONFIG_PATH = "/app/configs/xray.json"
 XRAY_PORT = 10000
-XRAY_PID_FILE = "/tmp/xray.pid"
 
 print(f"CF_DOMAIN: {CF_DOMAIN}")
 print(f"USER_PASS: {USER_PASS}")
@@ -42,31 +40,11 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now','localtime')),
             expire_at TEXT DEFAULT NULL
         );
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0,
-            config_id INTEGER DEFAULT NULL,
-            FOREIGN KEY(config_id) REFERENCES configs(id)
-        );
     """)
     conn.commit()
     conn.close()
 
 init_db()
-
-def create_admin():
-    conn = get_db()
-    conn.execute("DELETE FROM users WHERE username = 'admin'")
-    conn.commit()
-    hashed = hashlib.sha256(USER_PASS.encode()).hexdigest()
-    conn.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', ?, 1)", (hashed,))
-    conn.commit()
-    conn.close()
-    print(f"Admin created with password: {USER_PASS}")
-
-create_admin()
 
 # ==================== VLESS Link Generator ====================
 def generate_vless_link(config_uuid, remarks=""):
@@ -119,28 +97,18 @@ def generate_xray_config():
     return xray_config
 
 def restart_xray():
-    """ری‌استارت کردن Xray بعد از تغییر کانفیگ"""
     global xray_process
-    
-    # Generate fresh config
     generate_xray_config()
-    
-    # Kill old Xray
     try:
         subprocess.run(["pkill", "-f", "xray run"], check=False)
         import time
         time.sleep(1)
     except:
         pass
-    
-    # Start new Xray
     xray_process = subprocess.Popen(
         ["/usr/local/bin/xray", "run", "-config", CONFIG_PATH],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
-    
-    # Log Xray output
     import threading
     def log_xray():
         if xray_process and xray_process.stdout:
@@ -148,19 +116,17 @@ def restart_xray():
                 line_str = line.decode().strip()
                 if line_str:
                     print(f"XRAY: {line_str}")
-    
     threading.Thread(target=log_xray, daemon=True).start()
     print("Xray restarted")
 
-# Initial start
 restart_xray()
 
 # ==================== Session ====================
 sessions = {}
 
-def get_session(cookies):
-    cookie_str = cookies.get("session_id", "")
-    return sessions.get(cookie_str)
+def is_logged_in(cookies):
+    session_id = cookies.get("session_id", "")
+    return session_id in sessions
 
 # ==================== API Handler ====================
 class APIHandler(BaseHTTPRequestHandler):
@@ -168,7 +134,6 @@ class APIHandler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
 
@@ -197,52 +162,41 @@ class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"API [{self.path}]: {format % args}")
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
     def do_POST(self):
+        # لاگین فقط با پسورد
         if self.path == "/api/login":
             form = self._parse_form()
-            username = form.get("username", "")
             password = form.get("password", "")
 
-            conn = get_db()
-            user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-            conn.close()
-
-            hashed = hashlib.sha256(password.encode()).hexdigest()
-
-            if not user or user["password"] != hashed:
-                print(f"Login failed for {username}: hash={hashed[:10]}... expected={user['password'][:10] if user else 'no user'}...")
-                self._send_json({"detail": "Invalid username or password"}, 401)
+            if password != USER_PASS:
+                print(f"Login failed: wrong password")
+                self._send_json({"detail": "Wrong password"}, 401)
                 return
 
             session_id = secrets.token_hex(32)
-            sessions[session_id] = {
-                "id": user["id"], "username": user["username"],
-                "is_admin": bool(user["is_admin"]), "config_id": user["config_id"]
-            }
+            sessions[session_id] = True
 
-            print(f"Login successful: {username}")
+            print("Login successful")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._set_cookie("session_id", session_id)
             self.end_headers()
-            self.wfile.write(json.dumps({"success": True, "is_admin": bool(user["is_admin"])}).encode())
+            self.wfile.write(json.dumps({"success": True}).encode())
             return
 
+        # لاگ‌اوت
         if self.path == "/api/logout":
+            cookies = self._parse_cookies()
+            session_id = cookies.get("session_id", "")
+            if session_id in sessions:
+                del sessions[session_id]
             self._send_json({"success": True})
             return
 
+        # ساخت کانفیگ جدید
         if self.path == "/api/configs":
             cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
+            if not is_logged_in(cookies):
                 self._send_json({"error": "Unauthorized"}, 401)
                 return
 
@@ -258,12 +212,10 @@ class APIHandler(BaseHTTPRequestHandler):
             config_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.close()
 
-            # ری‌استارت Xray با کانفیگ جدید
             restart_xray()
-
             link = generate_vless_link(new_uuid, remarks)
-            print(f"Config created: {new_uuid} -> {link}")
-            
+            print(f"Config created: {new_uuid}")
+
             self._send_json({
                 "success": True,
                 "id": config_id,
@@ -273,49 +225,22 @@ class APIHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if self.path == "/api/users":
-            cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-
-            form = self._parse_form()
-            username = form.get("username", "")
-            password = form.get("password", "")
-
-            hashed = hashlib.sha256(password.encode()).hexdigest()
-            conn = get_db()
-            try:
-                conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
-                            (username, hashed))
-                conn.commit()
-                self._send_json({"success": True})
-            except sqlite3.IntegrityError:
-                self._send_json({"detail": "Username exists"}, 400)
-            finally:
-                conn.close()
-            return
-
         self._send_json({"error": "Not found"}, 404)
 
     def do_GET(self):
         cookies = self._parse_cookies()
-        session = get_session(cookies)
 
+        # چک لاگین
         if self.path == "/api/me":
-            if not session:
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            self._send_json({
-                "username": session["username"],
-                "is_admin": session["is_admin"],
-                "config_id": session["config_id"]
-            })
+            if is_logged_in(cookies):
+                self._send_json({"logged_in": True})
+            else:
+                self._send_json({"logged_in": False}, 401)
             return
 
+        # لیست کانفیگ‌ها
         if self.path == "/api/configs":
-            if not session or not session.get("is_admin"):
+            if not is_logged_in(cookies):
                 self._send_json({"error": "Unauthorized"}, 401)
                 return
 
@@ -338,52 +263,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._send_json(configs)
             return
 
-        if self.path == "/api/users":
-            if not session or not session.get("is_admin"):
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-
-            conn = get_db()
-            rows = conn.execute("""
-                SELECT u.id, u.username, u.is_admin, u.config_id, c.uuid as cuuid, c.name as cname
-                FROM users u LEFT JOIN configs c ON u.config_id = c.id ORDER BY u.id DESC
-            """).fetchall()
-            conn.close()
-
-            users = []
-            for r in rows:
-                users.append({
-                    "id": r["id"], "username": r["username"],
-                    "is_admin": bool(r["is_admin"]), "config_id": r["config_id"],
-                    "config_uuid": r["cuuid"], "config_name": r["cname"]
-                })
-
-            self._send_json(users)
-            return
-
-        if self.path == "/api/my-config":
-            if not session or not session.get("config_id"):
-                self._send_json({"has_config": False})
-                return
-
-            conn = get_db()
-            row = conn.execute("SELECT * FROM configs WHERE id = ?", (session["config_id"],)).fetchone()
-            conn.close()
-
-            if not row:
-                self._send_json({"has_config": False})
-                return
-
-            self._send_json({
-                "has_config": True, "id": row["id"], "uuid": row["uuid"],
-                "name": row["name"], "remarks": row["remarks"],
-                "vless_link": generate_vless_link(row["uuid"], row["remarks"]),
-                "domain_set": bool(CF_DOMAIN)
-            })
-            return
-
+        # health check
         if self.path == "/health":
-            import subprocess
             xray_status = "running" if subprocess.run(["pgrep", "-f", "xray run"], capture_output=True).returncode == 0 else "stopped"
             self._send_json({
                 "status": "ok",
@@ -394,57 +275,19 @@ class APIHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not found"}, 404)
 
-    def do_PUT(self):
-        if self.path.startswith("/api/configs/"):
-            config_id = self.path.split("/")[3]
-            cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-
-            form = self._parse_form()
-            conn = get_db()
-            conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=? WHERE id=?",
-                        (form.get("name", ""), form.get("remarks", ""),
-                         form.get("traffic_limit_gb", 0), config_id))
-            conn.commit()
-            conn.close()
-            restart_xray()
-            self._send_json({"success": True})
-            return
-        self._send_json({"error": "Not found"}, 404)
-
     def do_DELETE(self):
         if self.path.startswith("/api/configs/"):
             config_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
+            if not is_logged_in(cookies):
                 self._send_json({"error": "Unauthorized"}, 401)
                 return
 
             conn = get_db()
             conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
-            conn.execute("UPDATE users SET config_id = NULL WHERE config_id = ?", (config_id,))
             conn.commit()
             conn.close()
             restart_xray()
-            self._send_json({"success": True})
-            return
-
-        if self.path.startswith("/api/users/"):
-            user_id = self.path.split("/")[3]
-            cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-
-            conn = get_db()
-            conn.execute("DELETE FROM users WHERE id = ? AND username != 'admin'", (user_id,))
-            conn.commit()
-            conn.close()
             self._send_json({"success": True})
             return
         self._send_json({"error": "Not found"}, 404)
@@ -453,8 +296,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if "/toggle" in self.path:
             config_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
-            session = get_session(cookies)
-            if not session or not session.get("is_admin"):
+            if not is_logged_in(cookies):
                 self._send_json({"error": "Unauthorized"}, 401)
                 return
 
