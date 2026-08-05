@@ -2,18 +2,21 @@ import os
 import json
 import uuid
 import sqlite3
+import subprocess
 import secrets
 import hashlib
+import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import unquote_plus
 
 CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
 DB_PATH = "/app/data/panel.db"
 CONFIG_PATH = "/app/configs/xray.json"
 XRAY_PORT = 10000
+XRAY_PID_FILE = "/tmp/xray.pid"
 
 print(f"CF_DOMAIN: {CF_DOMAIN}")
 print(f"USER_PASS: {USER_PASS}")
@@ -55,16 +58,13 @@ init_db()
 
 def create_admin():
     conn = get_db()
-    admin = conn.execute("SELECT * FROM users WHERE username = 'admin'").fetchone()
+    conn.execute("DELETE FROM users WHERE username = 'admin'")
+    conn.commit()
     hashed = hashlib.sha256(USER_PASS.encode()).hexdigest()
-    if not admin:
-        conn.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', ?, 1)", (hashed,))
-        print("Admin user created")
-    else:
-        conn.execute("UPDATE users SET password = ? WHERE username = 'admin'", (hashed,))
-        print("Admin password updated")
+    conn.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', ?, 1)", (hashed,))
     conn.commit()
     conn.close()
+    print(f"Admin created with password: {USER_PASS}")
 
 create_admin()
 
@@ -80,7 +80,9 @@ def generate_vless_link(config_uuid, remarks=""):
         f"&path=%2Fws#{remark_text}"
     )
 
-# ==================== Xray Config Generator ====================
+# ==================== Xray Manager ====================
+xray_process = None
+
 def generate_xray_config():
     conn = get_db()
     configs = conn.execute("SELECT * FROM configs WHERE enabled = 1").fetchall()
@@ -113,11 +115,45 @@ def generate_xray_config():
     with open(CONFIG_PATH, "w") as f:
         json.dump(xray_config, f, indent=2)
 
-    print("Xray config generated")
+    print(f"Xray config updated with {len(clients)} clients")
     return xray_config
 
-# Generate on import
-generate_xray_config()
+def restart_xray():
+    """ری‌استارت کردن Xray بعد از تغییر کانفیگ"""
+    global xray_process
+    
+    # Generate fresh config
+    generate_xray_config()
+    
+    # Kill old Xray
+    try:
+        subprocess.run(["pkill", "-f", "xray run"], check=False)
+        import time
+        time.sleep(1)
+    except:
+        pass
+    
+    # Start new Xray
+    xray_process = subprocess.Popen(
+        ["/usr/local/bin/xray", "run", "-config", CONFIG_PATH],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+    
+    # Log Xray output
+    import threading
+    def log_xray():
+        if xray_process and xray_process.stdout:
+            for line in xray_process.stdout:
+                line_str = line.decode().strip()
+                if line_str:
+                    print(f"XRAY: {line_str}")
+    
+    threading.Thread(target=log_xray, daemon=True).start()
+    print("Xray restarted")
+
+# Initial start
+restart_xray()
 
 # ==================== Session ====================
 sessions = {}
@@ -131,15 +167,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, data, status=200):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def _send_html(self, html, status=200):
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
 
     def _parse_cookies(self):
         cookie_header = self.headers.get("Cookie", "")
@@ -157,7 +188,6 @@ class APIHandler(BaseHTTPRequestHandler):
         for item in body.split("&"):
             if "=" in item:
                 key, value = item.split("=", 1)
-                from urllib.parse import unquote_plus
                 form[unquote_plus(key)] = unquote_plus(value)
         return form
 
@@ -165,7 +195,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", f"{key}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
 
     def log_message(self, format, *args):
-        print(f"API: {format % args}")
+        print(f"API [{self.path}]: {format % args}")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_POST(self):
         if self.path == "/api/login":
@@ -180,6 +217,7 @@ class APIHandler(BaseHTTPRequestHandler):
             hashed = hashlib.sha256(password.encode()).hexdigest()
 
             if not user or user["password"] != hashed:
+                print(f"Login failed for {username}: hash={hashed[:10]}... expected={user['password'][:10] if user else 'no user'}...")
                 self._send_json({"detail": "Invalid username or password"}, 401)
                 return
 
@@ -189,6 +227,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "is_admin": bool(user["is_admin"]), "config_id": user["config_id"]
             }
 
+            print(f"Login successful: {username}")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._set_cookie("session_id", session_id)
@@ -197,11 +236,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/api/logout":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._set_cookie("session_id", "")
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode())
+            self._send_json({"success": True})
             return
 
         if self.path == "/api/configs":
@@ -223,18 +258,22 @@ class APIHandler(BaseHTTPRequestHandler):
             config_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.close()
 
-            generate_xray_config()
+            # ری‌استارت Xray با کانفیگ جدید
+            restart_xray()
 
+            link = generate_vless_link(new_uuid, remarks)
+            print(f"Config created: {new_uuid} -> {link}")
+            
             self._send_json({
                 "success": True,
                 "id": config_id,
                 "uuid": new_uuid,
-                "link": generate_vless_link(new_uuid, remarks),
+                "link": link,
                 "domain_set": bool(CF_DOMAIN)
             })
             return
 
-        if self.path.startswith("/api/users"):
+        if self.path == "/api/users":
             cookies = self._parse_cookies()
             session = get_session(cookies)
             if not session or not session.get("is_admin"):
@@ -344,20 +383,20 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/health":
-            self._send_json({"status": "ok", "cf_domain": CF_DOMAIN or "not set"})
+            import subprocess
+            xray_status = "running" if subprocess.run(["pgrep", "-f", "xray run"], capture_output=True).returncode == 0 else "stopped"
+            self._send_json({
+                "status": "ok",
+                "xray": xray_status,
+                "cf_domain": CF_DOMAIN or "not set"
+            })
             return
 
         self._send_json({"error": "Not found"}, 404)
 
     def do_PUT(self):
         if self.path.startswith("/api/configs/"):
-            parts = self.path.split("/")
-            if len(parts) >= 4:
-                config_id = parts[3]
-            else:
-                self._send_json({"error": "Invalid ID"}, 400)
-                return
-
+            config_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
             session = get_session(cookies)
             if not session or not session.get("is_admin"):
@@ -371,21 +410,14 @@ class APIHandler(BaseHTTPRequestHandler):
                          form.get("traffic_limit_gb", 0), config_id))
             conn.commit()
             conn.close()
-            generate_xray_config()
+            restart_xray()
             self._send_json({"success": True})
             return
-
         self._send_json({"error": "Not found"}, 404)
 
     def do_DELETE(self):
         if self.path.startswith("/api/configs/"):
-            parts = self.path.split("/")
-            if len(parts) >= 4:
-                config_id = parts[3]
-            else:
-                self._send_json({"error": "Invalid ID"}, 400)
-                return
-
+            config_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
             session = get_session(cookies)
             if not session or not session.get("is_admin"):
@@ -397,18 +429,12 @@ class APIHandler(BaseHTTPRequestHandler):
             conn.execute("UPDATE users SET config_id = NULL WHERE config_id = ?", (config_id,))
             conn.commit()
             conn.close()
-            generate_xray_config()
+            restart_xray()
             self._send_json({"success": True})
             return
 
         if self.path.startswith("/api/users/"):
-            parts = self.path.split("/")
-            if len(parts) >= 4:
-                user_id = parts[3]
-            else:
-                self._send_json({"error": "Invalid ID"}, 400)
-                return
-
+            user_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
             session = get_session(cookies)
             if not session or not session.get("is_admin"):
@@ -421,11 +447,10 @@ class APIHandler(BaseHTTPRequestHandler):
             conn.close()
             self._send_json({"success": True})
             return
-
         self._send_json({"error": "Not found"}, 404)
 
     def do_PATCH(self):
-        if self.path.startswith("/api/configs/") and "/toggle" in self.path:
+        if "/toggle" in self.path:
             config_id = self.path.split("/")[3]
             cookies = self._parse_cookies()
             session = get_session(cookies)
@@ -439,11 +464,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE configs SET enabled = ? WHERE id = ?",
                            (0 if row["enabled"] else 1, config_id))
                 conn.commit()
-                generate_xray_config()
+                restart_xray()
             conn.close()
             self._send_json({"success": True})
             return
-
         self._send_json({"error": "Not found"}, 404)
 
 
