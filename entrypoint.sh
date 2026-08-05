@@ -8,7 +8,7 @@ xray run -config /app/configs/xray.json &
 sleep 1
 
 # Start API server
-python3 /app/server.py &
+python3 /app/main.py &
 sleep 1
 
 # Start Nginx
