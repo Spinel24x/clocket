@@ -152,7 +152,7 @@ class XrayManager:
 
     def start(self):
         self.build_config()
-        subprocess.run(["pkill", "-f", "xray run"], check=False)
+        subprocess.run(["killall", "-f", "xray run"], check=False)
         time.sleep(1)
 
         self.process = subprocess.Popen(
