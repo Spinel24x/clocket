@@ -106,9 +106,9 @@ xray_process = None
 
 def build_xray_config():
     rows = db.get_all()
-    clients = [{"id": r["uuid"], "flow": "xtls-rprx-vision"} for r in rows]
+    clients = [{"id": r["uuid"]} for r in rows]
     if not clients:
-        clients = [{"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision"}]
+        clients = [{"id": str(uuid.uuid4())}]
 
     config = {
         "log": {"loglevel": "warning"},
