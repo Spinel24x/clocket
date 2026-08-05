@@ -1,3 +1,8 @@
+"""
+VLESS Panel - Professional Edition
+Modular architecture with proper error handling and logging
+"""
+
 import os
 import json
 import uuid
@@ -6,241 +11,396 @@ import subprocess
 import secrets
 import hashlib
 import time
-from datetime import datetime, timedelta
+import signal
+import sys
+import logging
+from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlparse
 
-CF_DOMAIN = os.getenv("CF_DOMAIN", "")
-USER_PASS = os.getenv("USER_PASS", "admin123")
-DB_PATH = "/app/data/panel.db"
-CONFIG_PATH = "/app/configs/xray.json"
-XRAY_PORT = 10000
+# ==================== Configuration ====================
+class Config:
+    CF_DOMAIN = os.getenv("CF_DOMAIN", "")
+    USER_PASS = os.getenv("USER_PASS", "admin123")
+    DB_PATH = "/app/data/panel.db"
+    CONFIG_PATH = "/app/configs/xray.json"
+    XRAY_BINARY = "/usr/local/bin/xray"
+    XRAY_PORT = 10000
+    API_PORT = 8000
+    NGINX_PORT = 8080
 
-print(f"CF_DOMAIN: {CF_DOMAIN}")
-print(f"USER_PASS: {USER_PASS}")
+# ==================== Logging ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
-# ==================== Database ====================
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+logger.info(f"Starting VLESS Panel")
+logger.info(f"CF_DOMAIN: {Config.CF_DOMAIN or 'NOT SET'}")
+logger.info(f"USER_PASS: {Config.USER_PASS}")
 
-def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uuid TEXT UNIQUE NOT NULL,
-            name TEXT DEFAULT '',
-            remarks TEXT DEFAULT '',
-            enabled INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT (datetime('now','localtime'))
-        );
-    """)
-    conn.commit()
-    conn.close()
+# ==================== Database Manager ====================
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
 
-init_db()
+    def get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self):
+        conn = self.get_conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uuid TEXT UNIQUE NOT NULL,
+                name TEXT DEFAULT 'Unnamed',
+                remarks TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now','localtime'))
+            );
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized")
+
+    def get_all_configs(self):
+        conn = self.get_conn()
+        rows = conn.execute("SELECT * FROM configs WHERE enabled = 1 ORDER BY created_at DESC").fetchall()
+        conn.close()
+        return rows
+
+    def add_config(self, uid, name, remarks):
+        conn = self.get_conn()
+        conn.execute(
+            "INSERT INTO configs (uuid, name, remarks) VALUES (?, ?, ?)",
+            (uid, name, remarks)
+        )
+        conn.commit()
+        conn.close()
+
+    def delete_config(self, config_id):
+        conn = self.get_conn()
+        conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
+        conn.commit()
+        conn.close()
+
+    def toggle_config(self, config_id):
+        conn = self.get_conn()
+        row = conn.execute("SELECT enabled FROM configs WHERE id = ?", (config_id,)).fetchone()
+        if row:
+            new_status = 0 if row["enabled"] else 1
+            conn.execute("UPDATE configs SET enabled = ? WHERE id = ?", (new_status, config_id))
+            conn.commit()
+        conn.close()
 
 # ==================== VLESS Link Generator ====================
-def generate_vless_link(config_uuid, remarks=""):
-    if not CF_DOMAIN:
-        return ""
-    remark_text = remarks or "VLESS"
-    return (
-        f"vless://{config_uuid}@{CF_DOMAIN}:443"
-        f"?encryption=none&security=tls&sni={CF_DOMAIN}"
-        f"&fp=chrome&type=ws&host={CF_DOMAIN}"
-        f"&path=%2Fws#{remark_text}"
-    )
+class VlessLinkGenerator:
+    @staticmethod
+    def generate(uuid_str, remarks=""):
+        if not Config.CF_DOMAIN:
+            return ""
+        remark = remarks or "VLESS"
+        return (
+            f"vless://{uuid_str}@{Config.CF_DOMAIN}:443"
+            f"?encryption=none&security=tls&sni={Config.CF_DOMAIN}"
+            f"&fp=chrome&type=ws&host={Config.CF_DOMAIN}"
+            f"&path=%2Fws#{remark}"
+        )
 
 # ==================== Xray Manager ====================
-def generate_xray_config():
-    conn = get_db()
-    configs = conn.execute("SELECT * FROM configs WHERE enabled = 1").fetchall()
-    conn.close()
+class XrayManager:
+    def __init__(self, db: Database):
+        self.db = db
+        self.config_path = Config.CONFIG_PATH
+        self.process = None
 
-    clients = []
-    for conf in configs:
-        clients.append({"id": conf["uuid"], "flow": "xtls-rprx-vision"})
+    def build_config(self):
+        configs = self.db.get_all_configs()
+        clients = [{"id": c["uuid"], "flow": "xtls-rprx-vision"} for c in configs]
 
-    if not clients:
-        clients = [{"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision"}]
+        if not clients:
+            clients = [{"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision"}]
 
-    xray_config = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": XRAY_PORT,
-            "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": "/ws"}
-            }
-        }],
-        "outbounds": [{"protocol": "freedom", "settings": {}}]
-    }
+        config = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+                "listen": "127.0.0.1",
+                "port": Config.XRAY_PORT,
+                "protocol": "vless",
+                "settings": {"clients": clients, "decryption": "none"},
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": {"path": "/ws"}
+                }
+            }],
+            "outbounds": [{"protocol": "freedom", "settings": {}}]
+        }
 
-    Path("/app/configs").mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(xray_config, f, indent=2)
+        Path(self.config_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.config_path, "w") as f:
+            json.dump(config, f, indent=2)
 
-    return xray_config
+        logger.info(f"Xray config built with {len(clients)} clients")
+        return config
 
-def restart_xray():
-    subprocess.run(["pkill", "-f", "xray run"], check=False)
-    time.sleep(1)
-    generate_xray_config()
-    subprocess.Popen(
-        ["/usr/local/bin/xray", "run", "-config", CONFIG_PATH],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    print("Xray restarted")
+    def start(self):
+        self.build_config()
+        subprocess.run(["pkill", "-f", "xray run"], check=False)
+        time.sleep(1)
 
-restart_xray()
+        self.process = subprocess.Popen(
+            [Config.XRAY_BINARY, "run", "-config", self.config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        logger.info("Xray started")
 
-# ==================== Session ====================
-sessions = {}
+    def restart(self):
+        self.start()
 
-# ==================== API Handler ====================
+    def is_running(self):
+        if self.process:
+            return self.process.poll() is None
+        return subprocess.run(["pgrep", "-f", "xray run"], capture_output=True).returncode == 0
+
+# ==================== Session Manager ====================
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}
+
+    def create(self):
+        session_id = secrets.token_hex(32)
+        self.sessions[session_id] = True
+        return session_id
+
+    def is_valid(self, session_id):
+        return session_id in self.sessions
+
+    def destroy(self, session_id):
+        self.sessions.pop(session_id, None)
+
+# ==================== HTTP API Handler ====================
 class APIHandler(BaseHTTPRequestHandler):
+    db = Database(Config.DB_PATH)
+    xray = XrayManager(db)
+    sessions = SessionManager()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     def _send_json(self, data, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def _parse_cookies(self):
-        cookie_header = self.headers.get("Cookie", "")
+    def _get_cookies(self):
+        cookie_str = self.headers.get("Cookie", "")
         cookies = {}
-        for item in cookie_header.split(";"):
+        for item in cookie_str.split(";"):
             if "=" in item:
-                key, value = item.strip().split("=", 1)
-                cookies[key] = value
+                k, v = item.strip().split("=", 1)
+                cookies[k] = v
         return cookies
 
-    def _parse_form(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length).decode()
+    def _get_form(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode()
         form = {}
         for item in body.split("&"):
             if "=" in item:
-                key, value = item.split("=", 1)
-                form[unquote_plus(key)] = unquote_plus(value)
+                k, v = item.split("=", 1)
+                form[unquote_plus(k)] = unquote_plus(v)
         return form
 
-    def do_POST(self):
-        if self.path == "/api/login":
-            form = self._parse_form()
-            password = form.get("password", "")
-            if password != USER_PASS:
-                self._send_json({"detail": "Wrong password"}, 401)
-                return
-            session_id = secrets.token_hex(32)
-            sessions[session_id] = True
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", f"session_id={session_id}; Path=/; HttpOnly")
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode())
-            return
+    def _require_auth(self):
+        cookies = self._get_cookies()
+        session_id = cookies.get("session_id", "")
+        if not self.sessions.is_valid(session_id):
+            self._send_json({"error": "Unauthorized"}, 401)
+            return False
+        return True
 
-        if self.path == "/api/configs":
-            cookies = self._parse_cookies()
-            if cookies.get("session_id", "") not in sessions:
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            form = self._parse_form()
-            new_uuid = str(uuid.uuid4())
-            name = form.get("name", "Unnamed")
-            remarks = form.get("remarks", "")
-            conn = get_db()
-            conn.execute("INSERT INTO configs (uuid, name, remarks) VALUES (?, ?, ?)",
-                        (new_uuid, name, remarks))
-            conn.commit()
-            conn.close()
-            restart_xray()
-            link = generate_vless_link(new_uuid, remarks)
-            self._send_json({"success": True, "uuid": new_uuid, "link": link, "domain_set": bool(CF_DOMAIN)})
-            return
+    def log_message(self, format, *args):
+        logger.info(f"{self.path}: {format % args}")
 
-        self._send_json({"error": "Not found"}, 404)
-
+    # ==================== Routing ====================
     def do_GET(self):
-        if self.path == "/health":
-            xray_running = subprocess.run(["pgrep", "-f", "xray run"], capture_output=True).returncode == 0
-            self._send_json({"status": "ok", "xray": "running" if xray_running else "stopped"})
-            return
+        path = urlparse(self.path).path
 
-        if self.path == "/api/me":
-            cookies = self._parse_cookies()
-            if cookies.get("session_id", "") in sessions:
-                self._send_json({"logged_in": True})
-            else:
-                self._send_json({"logged_in": False}, 401)
-            return
+        routes = {
+            "/health": self._handle_health,
+            "/api/me": self._handle_me,
+            "/api/configs": self._handle_list_configs,
+        }
 
-        if self.path == "/api/configs":
-            cookies = self._parse_cookies()
-            if cookies.get("session_id", "") not in sessions:
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            conn = get_db()
-            rows = conn.execute("SELECT * FROM configs ORDER BY created_at DESC").fetchall()
-            conn.close()
-            configs = [{
-                "id": r["id"], "uuid": r["uuid"], "name": r["name"],
-                "remarks": r["remarks"], "enabled": bool(r["enabled"]),
-                "vless_link": generate_vless_link(r["uuid"], r["remarks"]),
-                "domain_set": bool(CF_DOMAIN)
-            } for r in rows]
-            self._send_json(configs)
-            return
+        if path in routes:
+            routes[path]()
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
-        self._send_json({"error": "Not found"}, 404)
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        routes = {
+            "/api/login": self._handle_login,
+            "/api/logout": self._handle_logout,
+            "/api/configs": self._handle_create_config,
+        }
+
+        if path in routes:
+            routes[path]()
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
     def do_DELETE(self):
-        if self.path.startswith("/api/configs/"):
-            config_id = self.path.split("/")[3]
-            cookies = self._parse_cookies()
-            if cookies.get("session_id", "") not in sessions:
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            conn = get_db()
-            conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
-            conn.commit()
-            conn.close()
-            restart_xray()
-            self._send_json({"success": True})
-            return
-        self._send_json({"error": "Not found"}, 404)
+        path = urlparse(self.path).path
+        if path.startswith("/api/configs/"):
+            self._handle_delete_config(path)
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
     def do_PATCH(self):
-        if "/toggle" in self.path:
-            config_id = self.path.split("/")[3]
-            cookies = self._parse_cookies()
-            if cookies.get("session_id", "") not in sessions:
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            conn = get_db()
-            row = conn.execute("SELECT enabled FROM configs WHERE id = ?", (config_id,)).fetchone()
-            if row:
-                conn.execute("UPDATE configs SET enabled = ? WHERE id = ?",
-                           (0 if row["enabled"] else 1, config_id))
-                conn.commit()
-                restart_xray()
-            conn.close()
-            self._send_json({"success": True})
+        path = urlparse(self.path).path
+        if "/toggle" in path:
+            self._handle_toggle_config(path)
+        else:
+            self._send_json({"error": "Not found"}, 404)
+
+    # ==================== Handlers ====================
+    def _handle_health(self):
+        self._send_json({
+            "status": "ok",
+            "xray": "running" if self.xray.is_running() else "stopped",
+            "cf_domain": Config.CF_DOMAIN or "not set",
+            "timestamp": datetime.now().isoformat()
+        })
+
+    def _handle_me(self):
+        if self._require_auth():
+            self._send_json({"logged_in": True})
+
+    def _handle_login(self):
+        form = self._get_form()
+        password = form.get("password", "")
+
+        if password != Config.USER_PASS:
+            logger.warning(f"Failed login attempt")
+            self._send_json({"detail": "Wrong password"}, 401)
             return
-        self._send_json({"error": "Not found"}, 404)
+
+        session_id = self.sessions.create()
+        logger.info("Login successful")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", f"session_id={session_id}; Path=/; HttpOnly; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(json.dumps({"success": True}).encode())
+
+    def _handle_logout(self):
+        cookies = self._get_cookies()
+        session_id = cookies.get("session_id", "")
+        self.sessions.destroy(session_id)
+        self._send_json({"success": True})
+
+    def _handle_create_config(self):
+        if not self._require_auth():
+            return
+
+        form = self._get_form()
+        uid = str(uuid.uuid4())
+        name = form.get("name", "Unnamed")
+        remarks = form.get("remarks", "")
+
+        self.db.add_config(uid, name, remarks)
+        self.xray.restart()
+
+        link = VlessLinkGenerator.generate(uid, remarks)
+        logger.info(f"Config created: {uid}")
+
+        self._send_json({
+            "success": True,
+            "uuid": uid,
+            "name": name,
+            "remarks": remarks,
+            "link": link,
+            "domain_set": bool(Config.CF_DOMAIN)
+        })
+
+    def _handle_list_configs(self):
+        if not self._require_auth():
+            return
+
+        rows = self.db.get_all_configs()
+        configs = [{
+            "id": r["id"],
+            "uuid": r["uuid"],
+            "name": r["name"],
+            "remarks": r["remarks"],
+            "enabled": bool(r["enabled"]),
+            "created_at": r["created_at"],
+            "vless_link": VlessLinkGenerator.generate(r["uuid"], r["remarks"]),
+            "domain_set": bool(Config.CF_DOMAIN)
+        } for r in rows]
+
+        self._send_json(configs)
+
+    def _handle_delete_config(self, path):
+        if not self._require_auth():
+            return
+
+        try:
+            config_id = int(path.split("/")[3])
+            self.db.delete_config(config_id)
+            self.xray.restart()
+            self._send_json({"success": True})
+        except (IndexError, ValueError):
+            self._send_json({"error": "Invalid ID"}, 400)
+
+    def _handle_toggle_config(self, path):
+        if not self._require_auth():
+            return
+
+        try:
+            config_id = int(path.split("/")[3])
+            self.db.toggle_config(config_id)
+            self.xray.restart()
+            self._send_json({"success": True})
+        except (IndexError, ValueError):
+            self._send_json({"error": "Invalid ID"}, 400)
+
+
+# ==================== Main ====================
+def main():
+    # Start Xray first
+    db = Database(Config.DB_PATH)
+    xray = XrayManager(db)
+    xray.start()
+
+    # Start API server
+    logger.info(f"API Server starting on 0.0.0.0:{Config.API_PORT}")
+    server = HTTPServer(("0.0.0.0", Config.API_PORT), APIHandler)
+    
+    def shutdown(sig, frame):
+        logger.info("Shutting down...")
+        server.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    logger.info("Server is ready!")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
-    print("API Server starting on port 8000...")
-    server = HTTPServer(("0.0.0.0", 8000), APIHandler)
-    print("API Server running!")
-    server.serve_forever()
+    main()
