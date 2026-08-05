@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx curl unzip ca-certificates build-essential && \
+    nginx curl unzip ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -sL https://github.com/XTLS/Xray-core/releases/download/v1.8.21/Xray-linux-64.zip -o /tmp/xray.zip && \
@@ -11,12 +11,9 @@ RUN curl -sL https://github.com/XTLS/Xray-core/releases/download/v1.8.21/Xray-li
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
 
-RUN mkdir -p /app/configs /app/data /var/log/nginx /var/lib/nginx && \
+RUN mkdir -p /app/configs /app/data /var/log/nginx /var/lib/nginx /tmp/nginx && \
     chmod +x entrypoint.sh
 
 EXPOSE 8080
