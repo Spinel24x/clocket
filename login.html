@@ -1,1 +1,52 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Login</title><link rel="stylesheet" href="/style.css"></head><body><div class="container"><div class="login-card"><div class="login-header"><h1>VLESS Panel</h1></div><form id="f"><div class="form-group"><label>Password</label><input type="password" id="pw" required></div><div class="error-message" id="e"></div><button type="submit" class="btn-login">Login</button></form></div></div><script>document.getElementById('f').onsubmit=async function(ev){ev.preventDefault();document.getElementById('e').style.display='none';try{var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(document.getElementById('pw').value)});var d=await r.json();if(r.ok){window.location.href='/dashboard.html';}else{document.getElementById('e').textContent=d.detail||'Error';document.getElementById('e').style.display='block';}}catch(ex){document.getElementById('e').textContent='Connection error';document.getElementById('e').style.display='block';}};</script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - VLESS Panel</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>🔐 VLESS Panel</h1>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="password">🔑 Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="error-message" id="errorBox"></div>
+                <button type="submit" class="btn-login">Login</button>
+            </form>
+        </div>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var errorBox = document.getElementById('errorBox');
+            errorBox.style.display = 'none';
+
+            try {
+                var res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'password=' + encodeURIComponent(document.getElementById('password').value)
+                });
+                var data = await res.json();
+                
+                if (res.ok && data.success) {
+                    window.location.href = '/dashboard.html';
+                } else {
+                    errorBox.textContent = data.detail || 'Wrong password';
+                    errorBox.style.display = 'block';
+                }
+            } catch (err) {
+                errorBox.textContent = 'Connection error';
+                errorBox.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
