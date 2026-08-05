@@ -1,9 +1,91 @@
-async function init(){try{var r=await fetch('/api/me');if(!r.ok){window.location.href='/login.html';return;}loadConfigs();}catch(e){window.location.href='/login.html';}}
-function S(m,t){var x=document.getElementById('to');x.textContent=m;x.className='toast '+(t||'success');x.style.display='block';setTimeout(function(){x.style.display='none';},3000);}
-document.getElementById('cf').onsubmit=async function(e){e.preventDefault();var f=new URLSearchParams();f.append('name',document.getElementById('cn').value);f.append('remarks',document.getElementById('cr').value);var r=await fetch('/api/configs',{method:'POST',body:f});var d=await r.json();if(d.success){S('Created!');document.getElementById('cn').value='';document.getElementById('cr').value='';loadConfigs();}};
-async function loadConfigs(){var r=await fetch('/api/configs');var c=await r.json();var h=document.getElementById('cl');if(!c.length){h.innerHTML='<p style="color:#888;text-align:center;padding:20px;">No configs</p>';return;}h.innerHTML=c.map(function(x){return'<div class="config-item'+(x.enabled?'':' disabled')+'"><div class="config-info"><strong>'+(x.name||'Unnamed')+'</strong><br><code class="uuid-text">'+x.uuid+'</code>'+(x.vless_link?'<br><small style="color:#2ecc71">Ready</small>':'')+'</div><div class="config-actions">'+(x.vless_link?'<button class="btn-sm btn-copy" onclick="cp(\''+x.vless_link.replace(/'/g,"\\'")+'\')">Copy</button>':'')+'<button class="btn-sm btn-toggle" onclick="tg('+x.id+')">'+(x.enabled?'Disable':'Enable')+'</button><button class="btn-sm btn-delete" onclick="dc('+x.id+')">Del</button></div></div>';}).join('');}
-async function tg(id){await fetch('/api/configs/'+id+'/toggle',{method:'PATCH'});loadConfigs();}
-async function dc(id){if(!confirm('Delete?'))return;await fetch('/api/configs/'+id,{method:'DELETE'});S('Deleted');loadConfigs();}
-function cp(l){navigator.clipboard.writeText(l).then(function(){S('Copied!');}).catch(function(){prompt('Copy:',l);});}
-async function logout(){await fetch('/api/logout',{method:'POST'});window.location.href='/login.html';}
-document.addEventListener('DOMContentLoaded',init);
+async function init() {
+    try {
+        var res = await fetch('/api/me');
+        if (!res.ok) {
+            window.location.href = '/login.html';
+            return;
+        }
+        loadConfigs();
+        document.getElementById('addConfigForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var formData = new URLSearchParams();
+            formData.append('name', document.getElementById('cfgName').value);
+            formData.append('remarks', document.getElementById('cfgRemarks').value);
+            
+            var res = await fetch('/api/configs', { method: 'POST', body: formData });
+            var data = await res.json();
+            if (data.success) {
+                showToast('✅ Config created!');
+                document.getElementById('cfgName').value = '';
+                document.getElementById('cfgRemarks').value = '';
+                loadConfigs();
+            } else {
+                showToast('Error', 'error');
+            }
+        });
+    } catch (err) {
+        window.location.href = '/login.html';
+    }
+}
+
+function showToast(message, type) {
+    var toast = document.getElementById('toast');
+    toast.textContent = message;
+    toast.className = 'toast ' + (type || 'success');
+    toast.style.display = 'block';
+    setTimeout(function() { toast.style.display = 'none'; }, 3000);
+}
+
+async function loadConfigs() {
+    var res = await fetch('/api/configs');
+    var configs = await res.json();
+    var container = document.getElementById('configsList');
+    
+    if (!configs.length) {
+        container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">No configs yet. Create one above.</p>';
+        return;
+    }
+    
+    container.innerHTML = configs.map(function(c) {
+        var link = c.vless_link || '';
+        return '<div class="config-item' + (c.enabled ? '' : ' disabled') + '">' +
+            '<div class="config-info">' +
+            '<strong>' + (c.name || 'Unnamed') + '</strong> ' +
+            '<span class="badge ' + (c.enabled ? 'badge-active' : 'badge-inactive') + '">' + (c.enabled ? 'Active' : 'Disabled') + '</span>' +
+            '<br><code class="uuid-text">' + c.uuid + '</code>' +
+            (link ? '<br><small style="color:#2ecc71;">✅ VLESS link ready</small>' : '<br><small style="color:#e74c3c;">⚠️ Domain not set</small>') +
+            '</div>' +
+            '<div class="config-actions">' +
+            (link ? '<button class="btn-sm btn-copy" onclick="copyLink(\'' + link.replace(/'/g, "\\'") + '\')">📋 Copy</button>' : '') +
+            '<button class="btn-sm btn-toggle" onclick="toggleConfig(' + c.id + ')">' + (c.enabled ? '⏸ Disable' : '▶️ Enable') + '</button>' +
+            '<button class="btn-sm btn-delete" onclick="deleteConfig(' + c.id + ')">🗑</button>' +
+            '</div></div>';
+    }).join('');
+}
+
+async function toggleConfig(id) {
+    await fetch('/api/configs/' + id + '/toggle', { method: 'PATCH' });
+    loadConfigs();
+}
+
+async function deleteConfig(id) {
+    if (!confirm('Delete this config?')) return;
+    await fetch('/api/configs/' + id, { method: 'DELETE' });
+    showToast('🗑 Config deleted');
+    loadConfigs();
+}
+
+function copyLink(link) {
+    navigator.clipboard.writeText(link).then(function() {
+        showToast('📋 VLESS link copied!');
+    }).catch(function() {
+        prompt('Copy this link:', link);
+    });
+}
+
+async function logout() {
+    await fetch('/api/logout', { method: 'POST' });
+    window.location.href = '/login.html';
+}
+
+document.addEventListener('DOMContentLoaded', init);
