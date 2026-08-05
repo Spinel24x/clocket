@@ -2,6 +2,12 @@ let isAdmin = false;
 
 // ==================== Init ====================
 async function init() {
+    // فقط توی dashboard.html چک کن، نه login.html
+    if (window.location.pathname === '/login.html' || window.location.pathname === '/login') {
+        setupLoginForm();
+        return;
+    }
+    
     try {
         const res = await fetch('/api/me');
         if (!res.ok) {
@@ -14,7 +20,6 @@ async function init() {
         document.getElementById('userDisplay').textContent = 
             '👤 ' + user.username + (isAdmin ? ' (Admin)' : '');
 
-        // Check domain
         const healthRes = await fetch('/health');
         const health = await healthRes.json();
         if (health.cf_domain && health.cf_domain !== 'not set') {
@@ -42,6 +47,41 @@ async function init() {
     }
 }
 
+// ==================== Login Form ====================
+function setupLoginForm() {
+    const form = document.getElementById('loginForm');
+    if (!form) return;
+    
+    form.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const errorBox = document.getElementById('errorBox');
+        if (errorBox) errorBox.style.display = 'none';
+        
+        const formData = new FormData();
+        formData.append('username', document.getElementById('username').value);
+        formData.append('password', document.getElementById('password').value);
+        
+        try {
+            const res = await fetch('/api/login', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if (res.ok && data.success) {
+                window.location.href = '/dashboard.html';
+            } else {
+                if (errorBox) {
+                    errorBox.textContent = data.detail || 'Login failed';
+                    errorBox.style.display = 'block';
+                }
+            }
+        } catch (err) {
+            if (errorBox) {
+                errorBox.textContent = 'Connection error';
+                errorBox.style.display = 'block';
+            }
+        }
+    });
+}
+
 // ==================== Tabs ====================
 function setupTabs() {
     document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -58,6 +98,7 @@ function setupTabs() {
 function showToast(message, type) {
     type = type || 'success';
     const toast = document.getElementById('toast');
+    if (!toast) return;
     toast.textContent = message;
     toast.className = 'toast ' + type;
     toast.style.display = 'block';
@@ -66,50 +107,56 @@ function showToast(message, type) {
 
 // ==================== Forms ====================
 function setupForms() {
-    document.getElementById('addConfigForm').addEventListener('submit', async function(e) {
-        e.preventDefault();
-        const formData = new FormData();
-        formData.append('name', document.getElementById('cfgName').value);
-        formData.append('remarks', document.getElementById('cfgRemarks').value);
-        formData.append('traffic_limit_gb', document.getElementById('cfgTraffic').value);
-        formData.append('expire_days', document.getElementById('cfgExpire').value);
+    const configForm = document.getElementById('addConfigForm');
+    if (configForm) {
+        configForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const formData = new FormData();
+            formData.append('name', document.getElementById('cfgName').value);
+            formData.append('remarks', document.getElementById('cfgRemarks').value);
+            formData.append('traffic_limit_gb', document.getElementById('cfgTraffic').value);
+            formData.append('expire_days', document.getElementById('cfgExpire').value);
 
-        const res = await fetch('/api/configs', { method: 'POST', body: formData });
-        const data = await res.json();
+            const res = await fetch('/api/configs', { method: 'POST', body: formData });
+            const data = await res.json();
 
-        if (data.success) {
-            showToast('✅ Config created!');
-            document.getElementById('cfgName').value = '';
-            document.getElementById('cfgRemarks').value = '';
-            document.getElementById('cfgTraffic').value = '0';
-            document.getElementById('cfgExpire').value = '0';
-            loadConfigs();
-        } else {
-            showToast('Error: ' + (data.detail || 'Failed'), 'error');
-        }
-    });
+            if (data.success) {
+                showToast('✅ Config created!');
+                document.getElementById('cfgName').value = '';
+                document.getElementById('cfgRemarks').value = '';
+                document.getElementById('cfgTraffic').value = '0';
+                document.getElementById('cfgExpire').value = '0';
+                loadConfigs();
+            } else {
+                showToast('Error: ' + (data.detail || 'Failed'), 'error');
+            }
+        });
+    }
 
-    document.getElementById('addUserForm').addEventListener('submit', async function(e) {
-        e.preventDefault();
-        const formData = new FormData();
-        formData.append('username', document.getElementById('newUsername').value);
-        formData.append('password', document.getElementById('newPassword').value);
-        const cid = document.getElementById('assignConfigId').value;
-        if (cid) formData.append('config_id', cid);
+    const userForm = document.getElementById('addUserForm');
+    if (userForm) {
+        userForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const formData = new FormData();
+            formData.append('username', document.getElementById('newUsername').value);
+            formData.append('password', document.getElementById('newPassword').value);
+            const cid = document.getElementById('assignConfigId').value;
+            if (cid) formData.append('config_id', cid);
 
-        const res = await fetch('/api/users', { method: 'POST', body: formData });
-        const data = await res.json();
+            const res = await fetch('/api/users', { method: 'POST', body: formData });
+            const data = await res.json();
 
-        if (data.success) {
-            showToast('✅ User added!');
-            document.getElementById('newUsername').value = '';
-            document.getElementById('newPassword').value = '';
-            document.getElementById('assignConfigId').value = '';
-            loadUsers();
-        } else {
-            showToast(data.detail || 'Error', 'error');
-        }
-    });
+            if (data.success) {
+                showToast('✅ User added!');
+                document.getElementById('newUsername').value = '';
+                document.getElementById('newPassword').value = '';
+                document.getElementById('assignConfigId').value = '';
+                loadUsers();
+            } else {
+                showToast(data.detail || 'Error', 'error');
+            }
+        });
+    }
 }
 
 // ==================== Logout ====================
@@ -124,6 +171,7 @@ async function loadConfigs() {
     const res = await fetch('/api/configs');
     const configs = await res.json();
     const container = document.getElementById('configsList');
+    if (!container) return;
 
     if (!configs.length) {
         container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">No configs yet.</p>';
@@ -163,7 +211,7 @@ async function toggleConfig(id) {
 }
 
 async function deleteConfig(id) {
-    if (!confirm('Delete this config? All associated users will lose access.')) return;
+    if (!confirm('Delete this config?')) return;
     await fetch('/api/configs/' + id, { method: 'DELETE' });
     showToast('Config deleted');
     loadConfigs();
@@ -204,6 +252,7 @@ async function loadUsers() {
     const res = await fetch('/api/users');
     const users = await res.json();
     const container = document.getElementById('usersList');
+    if (!container) return;
 
     if (!users.length) {
         container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">No users yet.</p>';
@@ -237,6 +286,7 @@ async function loadMyConfig() {
     const res = await fetch('/api/my-config');
     const data = await res.json();
     const container = document.getElementById('myConfig');
+    if (!container) return;
 
     if (!data.has_config) {
         container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">No config assigned. Contact admin.</p>';
