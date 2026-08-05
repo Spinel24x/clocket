@@ -1,20 +1,18 @@
 #!/bin/bash
 set -e
 
-# Create directories
-mkdir -p /app/configs /app/data /var/log/nginx /var/lib/nginx
+mkdir -p /app/configs /app/data /var/log/nginx /var/lib/nginx /tmp/nginx
 
-# Generate initial Xray config
 cd /app
 python3 -c "from main import generate_xray_config; generate_xray_config()"
 
-# Start Xray in background
+# Start Xray
 xray run -config /app/configs/xray.json &
 sleep 1
 
-# Start Nginx in background
-nginx -c /app/nginx.conf -g 'daemon off;' &
-sleep 1
+# Start Nginx on 8080
+nginx -c /app/nginx.conf &
+sleep 2
 
-# Start FastAPI (foreground - Railway needs this)
+# Start FastAPI on 8000
 exec python3 main.py
