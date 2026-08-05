@@ -15,10 +15,6 @@
             </div>
             <form id="loginForm">
                 <div class="form-group">
-                    <label for="username">👤 Username</label>
-                    <input type="text" id="username" name="username" required placeholder="admin">
-                </div>
-                <div class="form-group">
                     <label for="password">🔑 Password</label>
                     <input type="password" id="password" name="password" required>
                 </div>
@@ -27,6 +23,31 @@
             </form>
         </div>
     </div>
-    <script src="/script.js"></script>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            var errorBox = document.getElementById('errorBox');
+            errorBox.style.display = 'none';
+
+            try {
+                var res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: 'password=' + encodeURIComponent(document.getElementById('password').value)
+                });
+                var data = await res.json();
+                
+                if (res.ok && data.success) {
+                    window.location.href = '/dashboard.html';
+                } else {
+                    errorBox.textContent = data.detail || 'Wrong password';
+                    errorBox.style.display = 'block';
+                }
+            } catch (err) {
+                errorBox.textContent = 'Connection error';
+                errorBox.style.display = 'block';
+            }
+        });
+    </script>
 </body>
 </html>
