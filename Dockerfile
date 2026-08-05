@@ -14,5 +14,6 @@ COPY . .
 RUN mkdir -p /app/configs /app/data /var/log/nginx /var/lib/nginx /tmp/nginx && \
     chmod +x entrypoint.sh
 
-EXPOSE 8080
+# Railway متغیر PORT را تزریق می‌کند (پیش‌فرض 8080)
+EXPOSE ${PORT:-8080}
 CMD ["/app/entrypoint.sh"]
