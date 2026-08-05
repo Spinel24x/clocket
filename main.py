@@ -119,7 +119,6 @@ def generate_xray_config():
 
     return xray_config
 
-# Generate config on startup
 generate_xray_config()
 
 # ==================== Session ====================
@@ -157,10 +156,12 @@ async def dashboard_page(request: Request):
         return RedirectResponse("/login.html")
 
 @app.get("/style.css")
-async def css(): return FileResponse("style.css", media_type="text/css")
+async def css():
+    return FileResponse("style.css", media_type="text/css")
 
 @app.get("/script.js")
-async def js(): return FileResponse("script.js", media_type="application/javascript")
+async def js():
+    return FileResponse("script.js", media_type="application/javascript")
 
 # ==================== Auth API ====================
 @app.post("/api/login")
@@ -228,7 +229,8 @@ async def update_config(request: Request, config_id: int, name: str = Form(""), 
     conn = get_db()
     conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=? WHERE id=?",
                  (name, remarks, traffic_limit_gb, config_id))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     generate_xray_config()
     return {"success": True}
 
@@ -238,7 +240,8 @@ async def delete_config(request: Request, config_id: int):
     conn = get_db()
     conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
     conn.execute("UPDATE users SET config_id = NULL WHERE config_id = ?", (config_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     generate_xray_config()
     return {"success": True}
 
@@ -292,7 +295,8 @@ async def delete_user(request: Request, user_id: int):
         conn.close()
         raise HTTPException(status_code=400, detail="Cannot delete admin")
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
     return {"success": True}
 
 @app.get("/api/my-config")
