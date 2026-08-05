@@ -17,8 +17,7 @@ from urllib.parse import unquote_plus, urlparse
 
 # ==================== Configuration ====================
 class Config:
-    # Railway به‌طور خودکار این متغیر را برابر دامنهٔ عمومی پروژه قرار می‌دهد
-    PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", os.getenv("PUBLIC_DOMAIN", ""))
+    CF_DOMAIN = os.getenv("CF_DOMAIN", "")                # دامنهٔ ورکر
     USER_PASS = os.getenv("USER_PASS", "admin123")
     DB_PATH = "/app/data/panel.db"
     CONFIG_PATH = "/app/configs/xray.json"
@@ -26,7 +25,6 @@ class Config:
     XRAY_PORT = 10000
     API_PORT = 8000
 
-# ==================== Logging ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -34,8 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info(f"VLESS Panel Starting")
-logger.info(f"Public Domain: {Config.PUBLIC_DOMAIN or 'NOT SET'}")
+logger.info(f"CF_DOMAIN: {Config.CF_DOMAIN or 'NOT SET'}")
 
 # ==================== Database ====================
 class Database:
@@ -93,14 +90,13 @@ db = Database()
 
 # ==================== VLESS Link Generator ====================
 def make_vless(uid, remarks=""):
-    """تولید لینک VLESS با دامنهٔ Railway"""
-    if not Config.PUBLIC_DOMAIN:
+    if not Config.CF_DOMAIN:
         return ""
     remark = remarks or "VLESS"
     return (
-        f"vless://{uid}@{Config.PUBLIC_DOMAIN}:443"
-        f"?encryption=none&security=tls&sni={Config.PUBLIC_DOMAIN}"
-        f"&fp=chrome&type=ws&host={Config.PUBLIC_DOMAIN}"
+        f"vless://{uid}@{Config.CF_DOMAIN}:443"
+        f"?encryption=none&security=tls&sni={Config.CF_DOMAIN}"
+        f"&fp=chrome&type=ws&host={Config.CF_DOMAIN}"
         f"&path=%2Fws#{remark}"
     )
 
@@ -108,9 +104,8 @@ def make_vless(uid, remarks=""):
 xray_process = None
 
 def build_xray_config():
-    """ساخت فایل کانفیگ Xray با کلاینت‌های فعال"""
     rows = db.get_all()
-    clients = [{"id": r["uuid"]} for r in rows]  # بدون flow
+    clients = [{"id": r["uuid"]} for r in rows]
     if not clients:
         clients = [{"id": str(uuid.uuid4())}]
 
@@ -136,7 +131,6 @@ def build_xray_config():
     logger.info(f"Xray config built with {len(clients)} clients")
 
 def start_xray():
-    """اجرای Xray با مدیریت صحیح فرآیند"""
     global xray_process
     if xray_process and xray_process.poll() is None:
         try:
@@ -169,13 +163,12 @@ def restart_xray():
 def is_xray_running():
     return xray_process is not None and xray_process.poll() is None
 
-# اجرای اولیه Xray
 start_xray()
 
 # ==================== Session Manager ====================
 sessions = {}
 
-# ==================== HTTP API Handler ====================
+# ==================== HTTP Handler ====================
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, data, status=200):
         self.send_response(status)
@@ -184,166 +177,125 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def _parse_cookies(self):
-        cookies = {}
-        cookie_header = self.headers.get("Cookie", "")
-        for item in cookie_header.split(";"):
+    def _cookies(self):
+        c = {}
+        for item in self.headers.get("Cookie", "").split(";"):
             if "=" in item:
-                key, value = item.strip().split("=", 1)
-                cookies[key] = value
-        return cookies
+                k, v = item.strip().split("=", 1)
+                c[k] = v
+        return c
 
-    def _parse_form(self):
+    def _form(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode()
-            form = {}
+            f = {}
             for item in body.split("&"):
                 if "=" in item:
-                    key, value = item.split("=", 1)
-                    form[unquote_plus(key)] = unquote_plus(value)
-            return form
+                    k, v = item.split("=", 1)
+                    f[unquote_plus(k)] = unquote_plus(v)
+            return f
         except:
             return {}
 
-    def _is_authenticated(self):
-        session_id = self._parse_cookies().get("session_id", "")
-        return session_id in sessions
+    def _auth(self):
+        return self._cookies().get("session_id", "") in sessions
 
-    def log_message(self, format, *args):
-        logger.info(f"{self.path}: {format % args}")
+    def log_message(self, fmt, *args):
+        logger.info(f"{self.path}: {fmt % args}")
 
-    # -------------------- GET --------------------
     def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/health":
+        p = urlparse(self.path).path
+        if p == "/health":
             self._send_json({
                 "status": "ok",
                 "xray": "running" if is_xray_running() else "stopped",
-                "domain": Config.PUBLIC_DOMAIN or "not set"
+                "cf_domain": Config.CF_DOMAIN or "not set"
             })
-            return
-
-        if path == "/api/me":
-            self._send_json({"logged_in": self._is_authenticated()}, 
-                            200 if self._is_authenticated() else 401)
-            return
-
-        if path == "/api/configs":
-            if not self._is_authenticated():
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
+        elif p == "/api/me":
+            self._send_json({"logged_in": self._auth()}, 200 if self._auth() else 401)
+        elif p == "/api/configs":
+            if not self._auth():
+                return self._send_json({"error": "Unauthorized"}, 401)
             rows = db.get_all()
-            configs = [{
-                "id": r["id"],
-                "uuid": r["uuid"],
-                "name": r["name"],
-                "remarks": r["remarks"],
-                "enabled": bool(r["enabled"]),
+            self._send_json([{
+                "id": r["id"], "uuid": r["uuid"], "name": r["name"],
+                "remarks": r["remarks"], "enabled": bool(r["enabled"]),
                 "vless_link": make_vless(r["uuid"], r["remarks"]),
-                "domain_set": bool(Config.PUBLIC_DOMAIN)
-            } for r in rows]
-            self._send_json(configs)
-            return
+                "domain_set": bool(Config.CF_DOMAIN)
+            } for r in rows])
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
-        self._send_json({"error": "Not found"}, 404)
-
-    # -------------------- POST --------------------
     def do_POST(self):
-        path = urlparse(self.path).path
-
-        if path == "/api/login":
-            password = self._parse_form().get("password", "")
-            if password != Config.USER_PASS:
-                self._send_json({"detail": "Wrong password"}, 401)
-                return
-            session_id = secrets.token_hex(32)
-            sessions[session_id] = True
+        p = urlparse(self.path).path
+        if p == "/api/login":
+            pw = self._form().get("password", "")
+            if pw != Config.USER_PASS:
+                return self._send_json({"detail": "Wrong password"}, 401)
+            sid = secrets.token_hex(32)
+            sessions[sid] = True
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", f"session_id={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+            self.send_header("Set-Cookie", f"session_id={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode())
-            logger.info("Login successful")
-            return
-
-        if path == "/api/logout":
-            session_id = self._parse_cookies().get("session_id", "")
-            sessions.pop(session_id, None)
+            logger.info("Login OK")
+        elif p == "/api/logout":
+            sessions.pop(self._cookies().get("session_id", ""), None)
             self._send_json({"success": True})
-            return
-
-        if path == "/api/configs":
-            if not self._is_authenticated():
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
-            form = self._parse_form()
-            new_uuid = str(uuid.uuid4())
-            name = form.get("name", "Unnamed")
-            remarks = form.get("remarks", "")
-            db.add(new_uuid, name, remarks)
+        elif p == "/api/configs":
+            if not self._auth():
+                return self._send_json({"error": "Unauthorized"}, 401)
+            f = self._form()
+            uid = str(uuid.uuid4())
+            name = f.get("name", "Unnamed")
+            remarks = f.get("remarks", "")
+            db.add(uid, name, remarks)
             restart_xray()
-            link = make_vless(new_uuid, remarks)
             self._send_json({
                 "success": True,
-                "uuid": new_uuid,
-                "link": link,
-                "domain_set": bool(Config.PUBLIC_DOMAIN)
+                "uuid": uid,
+                "link": make_vless(uid, remarks),
+                "domain_set": bool(Config.CF_DOMAIN)
             })
-            logger.info(f"Config created: {new_uuid}")
-            return
+            logger.info(f"Config created: {uid}")
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
-        self._send_json({"error": "Not found"}, 404)
-
-    # -------------------- DELETE --------------------
     def do_DELETE(self):
-        path = urlparse(self.path).path
-        if path.startswith("/api/configs/"):
-            if not self._is_authenticated():
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
+        p = urlparse(self.path).path
+        if p.startswith("/api/configs/") and self._auth():
             try:
-                config_id = int(path.split("/")[3])
-                db.delete(config_id)
+                db.delete(int(p.split("/")[3]))
                 restart_xray()
                 self._send_json({"success": True})
             except:
                 self._send_json({"error": "Invalid ID"}, 400)
-            return
-        self._send_json({"error": "Not found"}, 404)
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
-    # -------------------- PATCH --------------------
     def do_PATCH(self):
-        path = urlparse(self.path).path
-        if "/toggle" in path:
-            if not self._is_authenticated():
-                self._send_json({"error": "Unauthorized"}, 401)
-                return
+        p = urlparse(self.path).path
+        if "/toggle" in p and self._auth():
             try:
-                config_id = int(path.split("/")[3])
-                db.toggle(config_id)
+                db.toggle(int(p.split("/")[3]))
                 restart_xray()
                 self._send_json({"success": True})
             except:
                 self._send_json({"error": "Invalid ID"}, 400)
-            return
-        self._send_json({"error": "Not found"}, 404)
+        else:
+            self._send_json({"error": "Not found"}, 404)
 
-# ==================== Main ====================
 def main():
-    logger.info(f"API server starting on 0.0.0.0:{Config.API_PORT}")
+    logger.info(f"API on 0.0.0.0:{Config.API_PORT}")
     server = HTTPServer(("0.0.0.0", Config.API_PORT), Handler)
-
-    def shutdown(signal, frame):
-        logger.info("Shutting down...")
+    def shutdown(sig, frame):
         server.shutdown()
         sys.exit(0)
-
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-
-    logger.info("Server is ready!")
+    logger.info("Ready!")
     server.serve_forever()
 
 if __name__ == "__main__":
