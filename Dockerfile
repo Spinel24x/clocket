@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nginx curl unzip ca-certificates && \
+    nginx curl unzip ca-certificates procps && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -sL https://github.com/XTLS/Xray-core/releases/download/v1.8.21/Xray-linux-64.zip -o /tmp/xray.zip && \
