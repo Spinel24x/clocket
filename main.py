@@ -1,8 +1,3 @@
-"""
-VLESS Panel - Complete Working Version
-No external kill commands needed
-"""
-
 import os
 import json
 import uuid
@@ -14,6 +9,7 @@ import time
 import signal
 import sys
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -129,7 +125,7 @@ def build_xray_config():
 
 def start_xray():
     global xray_process
-    if xray_process:
+    if xray_process and xray_process.poll() is None:
         try:
             xray_process.terminate()
             xray_process.wait(timeout=3)
@@ -142,9 +138,15 @@ def start_xray():
     build_xray_config()
     xray_process = subprocess.Popen(
         [Config.XRAY_BINARY, "run", "-config", Config.CONFIG_PATH],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
     )
+    
+    def reader():
+        if xray_process and xray_process.stdout:
+            for line in xray_process.stdout:
+                logger.info(f"XRAY: {line.decode().strip()}")
+    threading.Thread(target=reader, daemon=True).start()
     logger.info("Xray started")
 
 def restart_xray():
